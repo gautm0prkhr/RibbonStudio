@@ -1,5 +1,5 @@
 // ============================================================================
-//  Ribbon 2.0 - A native Windows 11 music sketchpad & step sequencer
+//  Ribbon 2.1 - A native Windows 11 music sketchpad & step sequencer
 //  Single-file Win32 + WinMM C++17 studio. MIT licensed.
 //
 //  Features:
@@ -7,9 +7,12 @@
 //    - Per-track Volume, Pan, Resonant Filter Tone, Decay, Mute & Solo
 //    - 4 switchable patterns (A/B/C/D) + Song Chain mode + Swing groove
 //    - Master Stereo Reverb, Tempo-Synced Ping-Pong Delay & Soft Limiter
-//    - Musical Scale Quantizer, Step Accents, Paint-Drag, Undo (Ctrl+Z)
-//    - Built-in Presets, Smart Groove Generator, Live Oscilloscope & VU Meter
-//    - 16-bit 44.1 kHz Stereo WAV Export (offline isolated engine + FX tail)
+//    - Hybrid Note Selection:
+//        * Right-click any melodic step -> Floating 12-key Piano Popover
+//        * Vertical drag or Mouse Wheel on melodic steps -> Live Pitch Glide
+//        * Root Key selector + Custom Note Pool Editor (12-key toggle strip)
+//    - Step Accents, Paint-Drag, Undo (Ctrl+Z), Built-in Presets, Smart Groove
+//    - Live Oscilloscope, Stereo Peak Meter, 16-bit 44.1 kHz Stereo WAV Export
 //    - Windows 11 Dark Title Bar, Per-Monitor V2 DPI, .rib File Association
 //
 //  Build (MSVC x64 Native Tools):
@@ -59,6 +62,8 @@ static const int    MAXCH      = 8;
 static const int    MAXPAT     = 4;
 static const int    MAXVOICE   = 64;
 static const int    MAXUNDO    = 32;
+static const int    MIN_OFF    = -24;
+static const int    MAX_OFF    = 35;  // 5 full octaves (C..B) relative to track root
 static const double PI         = 3.14159265358979323846;
 static const double PI2        = 6.28318530717958647692;
 
@@ -79,44 +84,49 @@ static const COLORREF kKindColor[NKIND] = {
     RGB(255, 150, 206)  // Lead  - pink
 };
 
-static inline bool isDrum(int kind) { return kind <= CLAP; }
-
-enum ScaleType { SC_MINOR, SC_MAJOR, SC_PENTA, SC_PHRYG, SC_CHROM, NSCALE };
-static const wchar_t* kScaleName[NSCALE] = {
-    L"Minor", L"Major", L"Penta", L"Phryg", L"Chrom"
+static const wchar_t* kNoteNames[12] = {
+    L"C", L"C#", L"D", L"D#", L"E", L"F", L"F#", L"G", L"G#", L"A", L"A#", L"B"
 };
 
-static const int kScaleIntervals[NSCALE][12] = {
-    { 0, 2, 3, 5, 7, 8, 10, -1, -1, -1, -1, -1 },             // Natural Minor
-    { 0, 2, 4, 5, 7, 9, 11, -1, -1, -1, -1, -1 },             // Major
-    { 0, 3, 5, 7, 10, -1, -1, -1, -1, -1, -1, -1 },           // Minor Pentatonic
-    { 0, 1, 3, 5, 7, 8, 10, -1, -1, -1, -1, -1 },             // Phrygian
-    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }                  // Chromatic
+static inline bool isDrum(int kind) { return kind <= CLAP; }
+
+enum ScaleType { SC_MINOR, SC_MAJOR, SC_PENTA, SC_PHRYG, SC_FREE, SC_CUSTOM, NSCALE };
+static const wchar_t* kScaleName[NSCALE] = {
+    L"Minor", L"Major", L"Penta", L"Phryg", L"Free", L"Custom"
+};
+
+static const int kScaleIntervals[5][12] = {
+    { 0, 2, 3, 5, 7, 8, 10, -1, -1, -1, -1, -1 }, // Natural Minor
+    { 0, 2, 4, 5, 7, 9, 11, -1, -1, -1, -1, -1 }, // Major
+    { 0, 3, 5, 7, 10, -1, -1, -1, -1, -1, -1, -1 }, // Minor Pentatonic
+    { 0, 1, 3, 5, 7, 8, 10, -1, -1, -1, -1, -1 }, // Phrygian
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }      // Free (Chromatic)
 };
 
 static int scaleLength(int sc) {
+    if (sc < 0 || sc >= 5) return 12;
     int n = 0;
     while (n < 12 && kScaleIntervals[sc][n] >= 0) ++n;
     return n;
 }
 
-static bool inScale(int sc, int semi) {
-    int m = ((semi % 12) + 12) % 12;
+static unsigned buildScaleMask(int sc, int rootKey) {
+    if (sc < 0 || sc >= 5) return 0xFFFu;
+    unsigned mask = 0;
     int len = scaleLength(sc);
-    for (int i = 0; i < len; ++i)
-        if (kScaleIntervals[sc][i] == m) return true;
-    return false;
+    int rk = ((rootKey % 12) + 12) % 12;
+    for (int i = 0; i < len; ++i) {
+        int pc = (kScaleIntervals[sc][i] + rk) % 12;
+        mask |= (1u << pc);
+    }
+    return mask ? mask : 0xFFFu;
 }
 
-static int stepScaleOffset(int sc, int cur, int dir) {
-    int next = cur;
-    for (int tries = 0; tries < 24; ++tries) {
-        next += (dir > 0 ? 1 : -1);
-        if (next > 24) return 24;
-        if (next < -24) return -24;
-        if (inScale(sc, next)) return next;
-    }
-    return std::clamp(cur + dir, -24, 24);
+static int countMaskBits(unsigned m) {
+    int n = 0;
+    for (int i = 0; i < 12; ++i)
+        if (m & (1u << i)) ++n;
+    return n;
 }
 
 static int channelRootMidi(int kind) {
@@ -126,19 +136,20 @@ static int channelRootMidi(int kind) {
     return 60;                   // Lead C4
 }
 
+static int channelBaseOct(int kind) {
+    return (channelRootMidi(kind) / 12) - 1;
+}
+
 static void midiNoteName(int midi, wchar_t* out, size_t n) {
-    static const wchar_t* names[12] = {
-        L"C", L"C#", L"D", L"D#", L"E", L"F", L"F#", L"G", L"G#", L"A", L"A#", L"B"
-    };
     int note = ((midi % 12) + 12) % 12;
     int oct = (midi / 12) - 1;
-    swprintf(out, n, L"%s%d", names[note], oct);
+    swprintf(out, n, L"%s%d", kNoteNames[note], oct);
 }
 
 struct PatternTrack {
     unsigned    steps;       // bit i = active
     unsigned    accents;     // bit i = accented velocity
-    signed char off[STEPS];  // semitone offset from root
+    signed char off[STEPS];  // semitone offset from channel root (C)
 };
 
 struct Pattern {
@@ -159,6 +170,8 @@ struct Project {
     int        tempo;      // 40..240 BPM
     float      swing;      // 0..0.60
     int        scale;      // ScaleType
+    int        rootKey;    // 0..11 (C..B)
+    unsigned   customMask; // 12-bit allowed pitch classes for SC_CUSTOM
     float      master;     // 0..1
     float      reverbMix;  // 0..1
     float      delayMix;   // 0..1
@@ -167,6 +180,33 @@ struct Project {
     ChannelMix ch[MAXCH];
     Pattern    pat[MAXPAT];
 };
+
+static unsigned effectiveNoteMask(const Project& p) {
+    if (p.scale == SC_CUSTOM) {
+        unsigned m = p.customMask & 0xFFFu;
+        return m ? m : 1u;
+    }
+    return buildScaleMask(p.scale, p.rootKey);
+}
+
+static bool inActiveScale(const Project& p, int off) {
+    int pc = ((off % 12) + 12) % 12;
+    return (effectiveNoteMask(p) & (1u << pc)) != 0;
+}
+
+static int stepNoteOffset(const Project& p, int cur, int dir, bool chromatic) {
+    if (chromatic || p.scale == SC_FREE) {
+        return std::clamp(cur + (dir > 0 ? 1 : -1), MIN_OFF, MAX_OFF);
+    }
+    int next = cur;
+    for (int tries = 0; tries < 24; ++tries) {
+        next += (dir > 0 ? 1 : -1);
+        if (next > MAX_OFF) return MAX_OFF;
+        if (next < MIN_OFF) return MIN_OFF;
+        if (inActiveScale(p, next)) return next;
+    }
+    return std::clamp(cur + (dir > 0 ? 1 : -1), MIN_OFF, MAX_OFF);
+}
 
 static Project              g_proj;
 static Pattern              g_clipboard;
@@ -205,14 +245,16 @@ static const wchar_t* kPresetNames[] = {
 static const int kNumPresets = 5;
 
 static void resetMixDefaults(Project& p) {
-    p.tempo     = 92;
-    p.swing     = 0.14f;
-    p.scale     = SC_MINOR;
-    p.master    = 0.84f;
-    p.reverbMix = 0.24f;
-    p.delayMix  = 0.18f;
-    p.curPat    = 0;
-    p.songMode  = false;
+    p.tempo      = 92;
+    p.swing      = 0.14f;
+    p.scale      = SC_MINOR;
+    p.rootKey    = 0; // C
+    p.customMask = buildScaleMask(SC_MINOR, 0);
+    p.master     = 0.84f;
+    p.reverbMix  = 0.24f;
+    p.delayMix   = 0.18f;
+    p.curPat     = 0;
+    p.songMode   = false;
     for (int i = 0; i < MAXCH; ++i) {
         p.ch[i].kind  = i;
         p.ch[i].on    = true;
@@ -243,10 +285,9 @@ static void loadPreset(Project& p, int idx) {
     };
 
     if (idx == 0) {
-        // Lo-Fi Chill (90 BPM, Minor)
-        p.tempo = 90; p.swing = 0.22f; p.scale = SC_MINOR;
+        // Lo-Fi Chill (90 BPM, C Minor)
+        p.tempo = 90; p.swing = 0.22f; p.scale = SC_MINOR; p.rootKey = 0;
         p.reverbMix = 0.30f; p.delayMix = 0.22f;
-        // Pattern A
         int kA[] = {0, 6, 10}; for (int s : kA) setS(0, KICK, s, 0, s == 0);
         setS(0, SNARE, 4, 0, true); setS(0, SNARE, 12, 0, true);
         setS(0, CLAP, 12);
@@ -254,13 +295,12 @@ static void loadPreset(Project& p, int idx) {
         setS(0, BASS, 0, 0, true); setS(0, BASS, 6, 0); setS(0, BASS, 8, 3); setS(0, BASS, 12, -2);
         setS(0, KEYS, 2, 7); setS(0, KEYS, 7, 10); setS(0, KEYS, 10, 12, true); setS(0, KEYS, 14, 7);
         setS(0, PAD, 0, 0); setS(0, PAD, 8, 3);
-        // Pattern B (variation with Lead)
         p.pat[1] = p.pat[0];
         setS(1, KICK, 14);
         setS(1, LEAD, 0, 12, true); setS(1, LEAD, 3, 10); setS(1, LEAD, 6, 7); setS(1, LEAD, 10, 15, true); setS(1, LEAD, 14, 12);
     } else if (idx == 1) {
-        // Trap Bounce (138 BPM, Phrygian)
-        p.tempo = 138; p.swing = 0.08f; p.scale = SC_PHRYG;
+        // Trap Bounce (138 BPM, C Phrygian)
+        p.tempo = 138; p.swing = 0.08f; p.scale = SC_PHRYG; p.rootKey = 0;
         p.reverbMix = 0.24f; p.delayMix = 0.20f;
         p.ch[BASS].decay = 0.78f; p.ch[BASS].tone = 0.45f;
         int kA[] = {0, 3, 10, 14}; for (int s : kA) setS(0, KICK, s, 0, s == 0);
@@ -275,8 +315,8 @@ static void loadPreset(Project& p, int idx) {
         p.pat[1] = p.pat[0];
         setS(1, LEAD, 2, 12); setS(1, LEAD, 4, 13, true); setS(1, LEAD, 7, 15); setS(1, LEAD, 11, 13); setS(1, LEAD, 14, 12);
     } else if (idx == 2) {
-        // Synthwave (112 BPM, Minor)
-        p.tempo = 112; p.swing = 0.0f; p.scale = SC_MINOR;
+        // Synthwave (112 BPM, C Minor)
+        p.tempo = 112; p.swing = 0.0f; p.scale = SC_MINOR; p.rootKey = 0;
         p.reverbMix = 0.38f; p.delayMix = 0.30f;
         p.ch[LEAD].tone = 0.85f; p.ch[BASS].tone = 0.62f;
         for (int s = 0; s < 16; s += 4) setS(0, KICK, s, 0, true);
@@ -289,8 +329,8 @@ static void loadPreset(Project& p, int idx) {
         p.pat[1] = p.pat[0];
         setS(1, KEYS, 1, 19); setS(1, KEYS, 5, 15); setS(1, KEYS, 9, 17); setS(1, KEYS, 13, 14);
     } else if (idx == 3) {
-        // House Groove (124 BPM, Minor Penta)
-        p.tempo = 124; p.swing = 0.16f; p.scale = SC_PENTA;
+        // House Groove (124 BPM, C Minor Penta)
+        p.tempo = 124; p.swing = 0.16f; p.scale = SC_PENTA; p.rootKey = 0;
         p.reverbMix = 0.22f; p.delayMix = 0.24f;
         for (int s = 0; s < 16; s += 4) setS(0, KICK, s, 0, true);
         setS(0, CLAP, 4, 0, true); setS(0, CLAP, 12, 0, true);
@@ -301,7 +341,7 @@ static void loadPreset(Project& p, int idx) {
         p.pat[1] = p.pat[0];
         setS(1, SNARE, 14); setS(1, SNARE, 15, 0, true);
     }
-    // idx == 4 -> Blank Canvas
+    p.customMask = buildScaleMask(p.scale, p.rootKey);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,14 +386,13 @@ struct StereoDelay {
 
     void process(double inL, double inR, int delaySamples, double mix, double& outL, double& outR) {
         int dL = std::clamp(delaySamples, 64, MAX_BUF - 2);
-        int dR = std::clamp((delaySamples * 3) / 4, 64, MAX_BUF - 2); // stereo ping-pong feel
+        int dR = std::clamp((delaySamples * 3) / 4, 64, MAX_BUF - 2);
         int rL = (writePos - dL + MAX_BUF) % MAX_BUF;
         int rR = (writePos - dR + MAX_BUF) % MAX_BUF;
 
         double tapL = bufL[rL];
         double tapR = bufR[rR];
 
-        // Gentle LP filter in feedback loop
         dampL += (tapL - dampL) * 0.35;
         dampR += (tapR - dampR) * 0.35;
 
@@ -445,7 +484,6 @@ struct SynthEngine {
     StereoReverb reverb;
     unsigned     noiseState;
 
-    // Telemetry for UI
     float        scopeBuf[256];
     int          scopePos;
     float        meterL;
@@ -478,7 +516,6 @@ struct SynthEngine {
     }
 
     void spawn(int kind, double midiNote, double amp, float pan, float tone, float decayKnob, bool accent) {
-        // Find free slot, or steal quietest active voice
         int slot = -1;
         double minEnv = 1e9;
         int steal = 0;
@@ -498,19 +535,19 @@ struct SynthEngine {
         v.env    = 1.0;
 
         const double f0 = 440.0 * std::pow(2.0, (midiNote - 69.0) / 12.0);
-        const double dMul = 2.2 - 1.75 * std::clamp((double)decayKnob, 0.0, 1.0); // higher knob = longer decay
-        v.cutoffHz = 220.0 * std::pow(55.0, std::clamp((double)tone, 0.0, 1.0)); // ~220 Hz .. 12.1 kHz
+        const double dMul = 2.2 - 1.75 * std::clamp((double)decayKnob, 0.0, 1.0);
+        v.cutoffHz = 220.0 * std::pow(55.0, std::clamp((double)tone, 0.0, 1.0));
         v.res = 0.55;
 
         switch (kind) {
-        case KICK:  v.inc = 155.0; v.decayRate = 5.8 * dMul;  v.res = 0.70; break;
-        case SNARE: v.inc = 195.0; v.decayRate = 11.5 * dMul; v.res = 0.70; break;
+        case KICK:  v.inc = 155.0;  v.decayRate = 5.8 * dMul;  v.res = 0.70; break;
+        case SNARE: v.inc = 195.0;  v.decayRate = 11.5 * dMul; v.res = 0.70; break;
         case HAT:   v.inc = 3800.0; v.decayRate = 34.0 * dMul; v.res = 0.80; break;
-        case CLAP:  v.inc = 950.0; v.decayRate = 13.5 * dMul; v.res = 0.65; break;
-        case BASS:  v.inc = f0;    v.decayRate = 2.4 * dMul;  v.res = 0.48; break;
-        case KEYS:  v.inc = f0;    v.decayRate = 1.9 * dMul;  v.res = 0.65; break;
-        case PAD:   v.inc = f0;    v.decayRate = 0.75 * dMul; v.res = 0.68; break;
-        case LEAD:  v.inc = f0;    v.decayRate = 2.8 * dMul;  v.res = 0.42; break;
+        case CLAP:  v.inc = 950.0;  v.decayRate = 13.5 * dMul; v.res = 0.65; break;
+        case BASS:  v.inc = f0;     v.decayRate = 2.4 * dMul;  v.res = 0.48; break;
+        case KEYS:  v.inc = f0;     v.decayRate = 1.9 * dMul;  v.res = 0.65; break;
+        case PAD:   v.inc = f0;     v.decayRate = 0.75 * dMul; v.res = 0.68; break;
+        case LEAD:  v.inc = f0;     v.decayRate = 2.8 * dMul;  v.res = 0.42; break;
         }
         if (kind < MAXCH) chPulse[kind] = 1.0f;
     }
@@ -522,7 +559,6 @@ struct SynthEngine {
 
         switch (v.kind) {
         case KICK: {
-            // Punchy exponential pitch envelope + sub saturation + click transient
             v.inc = 44.0 + 130.0 * std::exp(-t * 36.0);
             double sub = std::sin(v.phase);
             double click = (t < 0.004) ? (1.0 - t / 0.004) * 0.45 * noise() : 0.0;
@@ -539,7 +575,6 @@ struct SynthEngine {
             break;
         }
         case HAT: {
-            // Metallic 3-oscillator shimmer + crisp high-passed noise
             double n = noise();
             double hp = n - v.hpState;
             v.hpState += hp * 0.14;
@@ -561,8 +596,7 @@ struct SynthEngine {
             break;
         }
         case BASS: {
-            // True bipolar triangle + sub sine + slightly detuned saw grit
-            double norm = v.phase / PI2; // 0..1
+            double norm = v.phase / PI2;
             double tri = (norm < 0.5) ? (4.0 * norm - 1.0) : (3.0 - 4.0 * norm);
             double saw = 2.0 * (v.phase2 / PI2) - 1.0;
             double sub = std::sin(v.phase);
@@ -570,7 +604,6 @@ struct SynthEngine {
             break;
         }
         case KEYS: {
-            // Warm Rhodes-like FM electric piano with gentle bell tine on attack
             double tine = std::exp(-t * 14.0) * 0.65;
             double mod = std::sin(v.phase * 4.0) * tine;
             out = std::sin(v.phase + mod) * 0.62
@@ -579,16 +612,14 @@ struct SynthEngine {
             break;
         }
         case PAD: {
-            // Lush 3-oscillator chordal pad (root, detuned root, fifth) with smooth attack
             double atk = std::min(1.0, t / 0.08);
             double s1 = std::sin(v.phase);
             double s2 = std::sin(v.phase2);
-            double s3 = std::sin(v.phase3); // fifth harmonic (1.498x)
+            double s3 = std::sin(v.phase3);
             out = (s1 * 0.46 + s2 * 0.38 + s3 * 0.26) * atk;
             break;
         }
         case LEAD: {
-            // Crisp detuned pulse + saw lead
             double sq  = (v.phase < PI) ? 0.55 : -0.55;
             double saw = (2.0 * (v.phase2 / PI2) - 1.0) * 0.45;
             out = sq + saw;
@@ -596,7 +627,6 @@ struct SynthEngine {
         }
         }
 
-        // Stable 2-pole State Variable Filter (modulated by envelope for melodic punch)
         double envMod = isDrum(v.kind) ? 1.0 : (0.35 + 0.65 * v.env);
         double fc = std::clamp(v.cutoffHz * envMod * (v.accent ? 1.25 : 1.0), 70.0, 14500.0);
         double f = 2.0 * std::sin(PI * fc / (double)SR);
@@ -606,7 +636,6 @@ struct SynthEngine {
         v.svfLow  += f * v.svfBand;
         double filtered = (v.kind == HAT) ? (out * 0.65 + hpF * 0.35) : v.svfLow;
 
-        // Advance oscillator phases
         double inc1 = v.inc;
         double inc2 = (v.kind == HAT) ? v.inc * 1.37 : v.inc * 1.006;
         double inc3 = (v.kind == PAD) ? v.inc * 1.4983 : v.inc * 1.73;
@@ -622,7 +651,6 @@ struct SynthEngine {
             return 0.0;
         }
 
-        // Smooth exponential-like curve
         double gain = v.env * v.env * v.amp;
         return filtered * gain;
     }
@@ -648,13 +676,11 @@ struct SynthEngine {
             int k = voices[i].kind;
             double s = renderVoice(voices[i]);
             if (s == 0.0) continue;
-            // Constant-power-like pan
             double pan = voices[i].pan * 0.5 + 0.5;
             double gL = std::cos(pan * PI * 0.5);
             double gR = std::sin(pan * PI * 0.5);
             dryL += s * gL;
             dryR += s * gR;
-            // Send melodic + snare/clap to Reverb/Delay; keep Kick & Bass tight
             double sendAmt = (k == KICK) ? 0.04 : (k == BASS) ? 0.12 : (k == HAT) ? 0.25 : 0.72;
             fxSendL += s * gL * sendAmt;
             fxSendR += s * gR * sendAmt;
@@ -675,7 +701,6 @@ struct SynthEngine {
             wetR += (rOutR - fxSendR);
         }
 
-        // Warm master soft-clipper
         outL = std::tanh(wetL * 1.15) * 0.94 * p.master;
         outR = std::tanh(wetR * 1.15) * 0.94 * p.master;
 
@@ -693,17 +718,16 @@ struct SynthEngine {
 static int calcStepSamples(int tempo, float swing, int stepIndex) {
     double base = 60.0 / (double)std::clamp(tempo, 40, 240) / 4.0 * (double)SR;
     double sw = std::clamp((double)swing, 0.0, 0.60);
-    // Even steps stretch slightly, odd steps shorten to preserve exact bar length!
     double factor = ((stepIndex % 2) == 0) ? (1.0 + sw * 0.45) : (1.0 - sw * 0.45);
     return std::max(256, (int)(base * factor));
 }
 
 // ---------------------------------------------------------------------------
-//  Real-time WinMM Audio Engine (Event-driven worker thread: deadlock-free!)
+//  Real-time WinMM Audio Engine (Event-driven worker thread)
 // ---------------------------------------------------------------------------
 
 static const int NUM_BUFS    = 3;
-static const int BUF_SAMPLES = 1024; // ~23ms per buffer, ultra-responsive & glitch-free
+static const int BUF_SAMPLES = 1024;
 
 static CRITICAL_SECTION g_cs;
 static SynthEngine      g_liveEngine;
@@ -744,7 +768,6 @@ static void fillAudioBuffer(short* dst, int frames) {
             dst[(pos + i) * 2]     = (short)(std::clamp(l, -1.0, 1.0) * 32000.0);
             dst[(pos + i) * 2 + 1] = (short)(std::clamp(r, -1.0, 1.0) * 32000.0);
         }
-        // Gentle decay of channel trigger LEDs
         for (int c = 0; c < MAXCH; ++c) g_liveEngine.chPulse[c] *= 0.90f;
         LeaveCriticalSection(&g_cs);
         pos += chunk;
@@ -852,6 +875,15 @@ static void previewChannelStep(int ch, int step) {
     LeaveCriticalSection(&g_cs);
 }
 
+static void previewMidiNote(int ch, int midi, bool accent = false) {
+    EnterCriticalSection(&g_cs);
+    int useCh = isDrum(ch) ? KEYS : ch;
+    int kind = g_proj.ch[useCh].kind;
+    g_liveEngine.spawn(kind, (double)midi, 0.54 * g_proj.ch[useCh].vol,
+                       g_proj.ch[useCh].pan, g_proj.ch[useCh].tone, g_proj.ch[useCh].decay, accent);
+    LeaveCriticalSection(&g_cs);
+}
+
 static void generateSmartGroove(int ch) {
     pushUndo();
     EnterCriticalSection(&g_cs);
@@ -861,7 +893,6 @@ static void generateSmartGroove(int ch) {
     unsigned seed = GetTickCount() ^ (unsigned)(ch * 2654435761u);
     auto rnd = [&]() -> unsigned { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; };
 
-    int len = scaleLength(g_proj.scale);
     if (ch == KICK) {
         tr.steps |= 1u; tr.accents |= 1u;
         for (int s = 2; s < 16; ++s) {
@@ -881,14 +912,21 @@ static void generateSmartGroove(int ch) {
             }
         }
     } else {
+        unsigned mask = effectiveNoteMask(g_proj);
+        std::vector<int> pool;
+        for (int i = 0; i < 12; ++i) {
+            int pc = (g_proj.rootKey + i) % 12;
+            if (mask & (1u << pc)) pool.push_back(pc);
+        }
+        if (pool.empty()) pool.push_back(0);
         int density = (ch == PAD) ? 2 : (ch == BASS) ? 5 : 6;
         for (int i = 0; i < density; ++i) {
             int s = (ch == PAD) ? (i * 8) : (int)(rnd() % 16);
             tr.steps |= (1u << s);
             if (i == 0) tr.accents |= (1u << s);
-            int deg = (int)(rnd() % len);
+            int pc = (i == 0) ? pool[0] : pool[rnd() % pool.size()];
             int oct = (ch == LEAD && (rnd() % 2)) ? 12 : 0;
-            tr.off[s] = (signed char)(kScaleIntervals[g_proj.scale][deg] + oct);
+            tr.off[s] = (signed char)std::clamp(pc + oct, MIN_OFF, MAX_OFF);
         }
     }
     LeaveCriticalSection(&g_cs);
@@ -898,7 +936,7 @@ static void generateSmartGroove(int ch) {
 }
 
 // ---------------------------------------------------------------------------
-//  UI Layout, Theme, and Rendering
+//  UI Layout, Theme, Popover State, and Rendering
 // ---------------------------------------------------------------------------
 
 static const int WIN_W   = 1180;
@@ -913,6 +951,9 @@ static const int ROW_H   = 36;
 static const int LABEL_W = 78;
 static const int CELL_H  = 28;
 
+static const int POP_W   = 296;
+static const int POP_H   = 164;
+
 static HWND  g_main      = NULL;
 static HFONT g_font      = NULL;
 static HFONT g_fontBold  = NULL;
@@ -926,6 +967,7 @@ static const COLORREF C_BG       = RGB(20, 17, 26);
 static const COLORREF C_TOP      = RGB(29, 25, 38);
 static const COLORREF C_PANEL    = RGB(26, 22, 34);
 static const COLORREF C_CARD     = RGB(31, 27, 41);
+static const COLORREF C_CARD_HI  = RGB(42, 36, 56);
 static const COLORREF C_CELL     = RGB(36, 31, 47);
 static const COLORREF C_BEAT     = RGB(46, 40, 60);
 static const COLORREF C_LINE     = RGB(58, 51, 74);
@@ -941,22 +983,52 @@ enum Hot {
     HOT_CHANNEL, HOT_RAIL_MUTE, HOT_RAIL_SOLO, HOT_STEP,
     HOT_VOL, HOT_PAN, HOT_TONE, HOT_DECAY, HOT_MUTE, HOT_SOLO,
     HOT_CLEAR_CH, HOT_GROOVE_CH,
-    HOT_REVERB, HOT_DELAY, HOT_SCALE, HOT_COPY, HOT_PASTE, HOT_UNDO
+    HOT_REVERB, HOT_DELAY, HOT_ROOT_KEY, HOT_SCALE, HOT_NOTE_POOL,
+    HOT_COPY, HOT_PASTE, HOT_UNDO
 };
 
 enum DragMode {
     DRAG_NONE, DRAG_VOL, DRAG_PAN, DRAG_TONE, DRAG_DECAY,
     DRAG_MASTER, DRAG_REVERB, DRAG_DELAY, DRAG_TEMPO, DRAG_SWING,
-    DRAG_PAINT_ON, DRAG_PAINT_OFF
+    DRAG_PAINT_ON, DRAG_PAINT_OFF, DRAG_STEP_MAYBE, DRAG_PITCH
 };
 
-static Hot      g_hot        = HOT_NONE;
-static int      g_hotIdx     = -1;
-static int      g_hotStep    = -1;
-static DragMode g_drag       = DRAG_NONE;
-static int      g_dragY0     = 0;
-static int      g_dragTempo0 = 92;
-static float    g_dragSwing0 = 0.0f;
+enum PopMode { POP_NONE, POP_STEP_NOTE, POP_NOTE_POOL };
+
+enum PopHot {
+    PHOT_NONE, PHOT_KEY, PHOT_OCT_DN, PHOT_OCT_UP, PHOT_ACC, PHOT_CLEAR,
+    PHOT_P_MIN, PHOT_P_MAJ, PHOT_P_PNT, PHOT_P_ALL, PHOT_DONE
+};
+
+struct PopoverState {
+    bool    open   = false;
+    PopMode mode   = POP_NONE;
+    int     ch     = KEYS;
+    int     step   = 0;
+    int     oct    = 4; // displayed octave for POP_STEP_NOTE
+    RECT    rect   = { 0, 0, 0, 0 };
+    PopHot  hot    = PHOT_NONE;
+    int     hotPC  = -1;
+};
+
+static PopoverState g_pop;
+
+static Hot      g_hot          = HOT_NONE;
+static int      g_hotIdx       = -1;
+static int      g_hotStep      = -1;
+static DragMode g_drag         = DRAG_NONE;
+static int      g_dragX0       = 0;
+static int      g_dragY0       = 0;
+static int      g_dragTempo0   = 92;
+static float    g_dragSwing0   = 0.0f;
+static int      g_dragCh       = 0;
+static int      g_dragStep     = 0;
+static int      g_dragOff0     = 0;
+static int      g_dragLastStep = 0;
+
+static DWORD    g_lastWheelTick = 0;
+static int      g_lastWheelCh   = -1;
+static int      g_lastWheelStep = -1;
 
 // Layout rects
 static RECT playRect()   { return { 202, 16, 238, 52 }; }
@@ -1035,9 +1107,18 @@ static RECT fxSliderRect(int idx) {
     int y = c.top + 48 + idx * 34;
     return { c.left + 68, y, c.right - 44, y + 16 };
 }
+// Sleek 3-pill Key / Scale / Notes row (fits cleanly even at MIN_W)
+static RECT rootKeyBtnRect() {
+    RECT c = cardFxRect();
+    return { c.left + 14, c.top + 118, c.left + 56, c.top + 144 };
+}
 static RECT scaleBtnRect() {
     RECT c = cardFxRect();
-    return { c.left + 14, c.top + 118, c.right - 14, c.top + 144 };
+    return { c.left + 62, c.top + 118, c.right - 66, c.top + 144 };
+}
+static RECT notePoolBtnRect() {
+    RECT c = cardFxRect();
+    return { c.right - 60, c.top + 118, c.right - 14, c.top + 144 };
 }
 static RECT utilBtnRect(int idx) {
     RECT c = cardFxRect();
@@ -1046,7 +1127,156 @@ static RECT utilBtnRect(int idx) {
     return { x, c.top + 152, x + w, c.top + 178 };
 }
 
+// ---------------------------------------------------------------------------
+//  Floating 12-Key Popover Geometry & Actions
+// ---------------------------------------------------------------------------
+
+static const int kWhitePC[7] = { 0, 2, 4, 5, 7, 9, 11 };
+static const int kBlackPC[5] = { 1, 3, 6, 8, 10 };
+static const int kBlackBoundary[5] = { 1, 2, 4, 5, 6 };
+
+static RECT popWhiteKeyRect(int wIdx) {
+    int kbL = g_pop.rect.left + 8;
+    int kbT = g_pop.rect.top + 40;
+    return { kbL + wIdx * 40, kbT, kbL + wIdx * 40 + 39, kbT + 96 };
+}
+
+static RECT popBlackKeyRect(int bIdx) {
+    int kbL = g_pop.rect.left + 8;
+    int kbT = g_pop.rect.top + 40;
+    int cx = kbL + kBlackBoundary[bIdx] * 40;
+    return { cx - 13, kbT, cx + 13, kbT + 58 };
+}
+
+// Step-mode popover header controls
+static RECT popOctDnRect()  { return { g_pop.rect.right - 150, g_pop.rect.top + 7, g_pop.rect.right - 126, g_pop.rect.top + 29 }; }
+static RECT popOctValRect() { return { g_pop.rect.right - 125, g_pop.rect.top + 7, g_pop.rect.right - 91,  g_pop.rect.top + 29 }; }
+static RECT popOctUpRect()  { return { g_pop.rect.right - 90,  g_pop.rect.top + 7, g_pop.rect.right - 66,  g_pop.rect.top + 29 }; }
+static RECT popAccRect()    { return { g_pop.rect.right - 60,  g_pop.rect.top + 7, g_pop.rect.right - 30,  g_pop.rect.top + 29 }; }
+static RECT popClearRect()  { return { g_pop.rect.right - 26,  g_pop.rect.top + 7, g_pop.rect.right - 8,   g_pop.rect.top + 29 }; }
+
+// Pool-mode popover header controls
+static RECT popPoolPresetRect(int idx) {
+    // 0=Min, 1=Maj, 2=Pnt, 3=All
+    const int xOff[4] = { 184, 150, 116, 82 };
+    const int w[4]    = { 30,  30,  30,  28 };
+    return { g_pop.rect.right - xOff[idx], g_pop.rect.top + 7, g_pop.rect.right - xOff[idx] + w[idx], g_pop.rect.top + 29 };
+}
+static RECT popDoneRect()   { return { g_pop.rect.right - 48,  g_pop.rect.top + 7, g_pop.rect.right - 8,   g_pop.rect.top + 29 }; }
+
+static RECT calcClampedPopRect(RECT anchor, bool preferAbove) {
+    int x = (anchor.left + anchor.right) / 2 - POP_W / 2;
+    int y = preferAbove ? (anchor.top - POP_H - 8) : (anchor.bottom + 8);
+    if (preferAbove && y < TOP_H + 6) y = anchor.bottom + 8;
+    if (!preferAbove && y + POP_H > g_client.bottom - FOOT_H - 6) y = anchor.top - POP_H - 8;
+
+    int minX = RAIL_W + 10;
+    int maxX = std::max(minX, (int)g_client.right - POP_W - 10);
+    int minY = TOP_H + 6;
+    int maxY = std::max(minY, (int)g_client.bottom - FOOT_H - POP_H - 6);
+    x = std::clamp(x, minX, maxX);
+    y = std::clamp(y, minY, maxY);
+    return { x, y, x + POP_W, y + POP_H };
+}
+
+static void openStepNotePopover(int ch, int step) {
+    if (isDrum(ch)) return;
+    g_sel = ch;
+    int curOff = 0;
+    EnterCriticalSection(&g_cs);
+    curOff = g_proj.pat[g_proj.curPat].tr[ch].off[step];
+    LeaveCriticalSection(&g_cs);
+
+    int midi = channelRootMidi(ch) + curOff;
+    int baseOct = channelBaseOct(ch);
+    int oct = std::clamp((midi / 12) - 1, baseOct - 2, baseOct + 2);
+
+    g_pop.open  = true;
+    g_pop.mode  = POP_STEP_NOTE;
+    g_pop.ch    = ch;
+    g_pop.step  = step;
+    g_pop.oct   = oct;
+    g_pop.rect  = calcClampedPopRect(cellRect(ch, step), true);
+    g_pop.hot   = PHOT_NONE;
+    g_pop.hotPC = -1;
+}
+
+static void openNotePoolPopover() {
+    g_pop.open  = true;
+    g_pop.mode  = POP_NOTE_POOL;
+    g_pop.rect  = calcClampedPopRect(scaleBtnRect(), true);
+    g_pop.hot   = PHOT_NONE;
+    g_pop.hotPC = -1;
+}
+
+static void closePopover() {
+    g_pop.open  = false;
+    g_pop.mode  = POP_NONE;
+    g_pop.hot   = PHOT_NONE;
+    g_pop.hotPC = -1;
+}
+
+static void assignStepPitchClass(int pc, bool closeAfter) {
+    pushUndo();
+    int midi = (g_pop.oct + 1) * 12 + pc;
+    int off = std::clamp(midi - channelRootMidi(g_pop.ch), MIN_OFF, MAX_OFF);
+    EnterCriticalSection(&g_cs);
+    PatternTrack& tr = g_proj.pat[g_proj.curPat].tr[g_pop.ch];
+    tr.steps |= (1u << g_pop.step);
+    tr.off[g_pop.step] = (signed char)off;
+    LeaveCriticalSection(&g_cs);
+    previewChannelStep(g_pop.ch, g_pop.step);
+
+    wchar_t nbuf[16], msg[64];
+    midiNoteName(channelRootMidi(g_pop.ch) + off, nbuf, 16);
+    swprintf(msg, 64, L"%s step %d -> %s", kKindName[g_pop.ch], g_pop.step + 1, nbuf);
+    setToast(msg, 1600);
+    if (closeAfter) closePopover();
+}
+
+static void togglePoolNote(int pc) {
+    pushUndo();
+    bool turnedOn = false;
+    bool rejected = false;
+    EnterCriticalSection(&g_cs);
+    if (g_proj.scale != SC_CUSTOM) {
+        g_proj.customMask = effectiveNoteMask(g_proj);
+        g_proj.scale = SC_CUSTOM;
+    }
+    unsigned bit = 1u << pc;
+    if (g_proj.customMask & bit) {
+        if (countMaskBits(g_proj.customMask) <= 1) {
+            rejected = true;
+        } else {
+            g_proj.customMask &= ~bit;
+        }
+    } else {
+        g_proj.customMask |= bit;
+        turnedOn = true;
+    }
+    LeaveCriticalSection(&g_cs);
+
+    if (rejected) {
+        setToast(L"Keep at least 1 note active in your note pool");
+    } else if (turnedOn) {
+        int previewCh = isDrum(g_sel) ? KEYS : g_sel;
+        previewMidiNote(previewCh, channelRootMidi(previewCh) + pc, false);
+    }
+}
+
 // Drawing helpers
+static inline bool inRect(RECT r, int x, int y) {
+    return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+}
+
+static COLORREF mixColor(COLORREF a, COLORREF b, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    int r = (int)(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t);
+    int g = (int)(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t);
+    int bl = (int)(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t);
+    return RGB(std::clamp(r, 0, 255), std::clamp(g, 0, 255), std::clamp(bl, 0, 255));
+}
+
 static void fill(HDC dc, RECT r, COLORREF c) {
     HBRUSH b = CreateSolidBrush(c);
     FillRect(dc, &r, b);
@@ -1092,14 +1322,176 @@ static void drawSlider(HDC dc, RECT r, float t, COLORREF accent, bool bipolar = 
         SelectObject(dc, ob); SelectObject(dc, op);
         DeleteObject(b); DeleteObject(p);
     }
-    // Thumb dot
     int tx = r.left + 2 + (int)(innerW * t);
     RECT thumb = { tx - 3, r.top + 1, tx + 4, r.bottom - 1 };
     roundRectFill(dc, thumb, 4, C_CREAM, accent);
 }
 
+static void paintPopover(HDC dc, const Project& p) {
+    if (!g_pop.open) return;
+
+    RECT pr = g_pop.rect;
+    // Soft layered drop shadow
+    RECT sh2 = { pr.left - 4, pr.top + 4, pr.right + 6, pr.bottom + 8 };
+    roundRectFill(dc, sh2, 14, RGB(11, 9, 16), RGB(11, 9, 16));
+    RECT sh1 = { pr.left - 2, pr.top + 2, pr.right + 3, pr.bottom + 4 };
+    roundRectFill(dc, sh1, 12, RGB(15, 12, 22), RGB(15, 12, 22));
+
+    COLORREF accent = (g_pop.mode == POP_STEP_NOTE) ? kKindColor[g_pop.ch] : C_AMBER;
+    roundRectFill(dc, pr, 12, RGB(34, 29, 46), accent, 1);
+
+    unsigned mask = effectiveNoteMask(p);
+    wchar_t buf[64];
+
+    if (g_pop.mode == POP_STEP_NOTE) {
+        const PatternTrack& tr = p.pat[p.curPat].tr[g_pop.ch];
+        bool isOn  = (tr.steps & (1u << g_pop.step)) != 0;
+        bool isAcc = (tr.accents & (1u << g_pop.step)) != 0;
+        int curMidi = channelRootMidi(g_pop.ch) + tr.off[g_pop.step];
+        int curPC   = ((curMidi % 12) + 12) % 12;
+        int curOct  = (curMidi / 12) - 1;
+
+        wchar_t nbuf[16];
+        midiNoteName(curMidi, nbuf, 16);
+        swprintf(buf, 64, L"%s S%d  %s", kKindName[g_pop.ch], g_pop.step + 1, isOn ? nbuf : L"--");
+        RECT titleR = { pr.left + 10, pr.top + 6, pr.right - 154, pr.top + 30 };
+        drawText(dc, titleR, buf, accent, g_fontBold);
+
+        // Oct - / Oct N / Oct +
+        RECT dnR = popOctDnRect();
+        roundRectFill(dc, dnR, 5, (g_pop.hot == PHOT_OCT_DN) ? C_CARD_HI : RGB(44, 38, 58), C_LINE);
+        drawText(dc, dnR, L"-", C_CREAM, g_fontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        RECT ovR = popOctValRect();
+        swprintf(buf, 32, L"Oct %d", g_pop.oct);
+        drawText(dc, ovR, buf, C_MUTED, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        RECT upR = popOctUpRect();
+        roundRectFill(dc, upR, 5, (g_pop.hot == PHOT_OCT_UP) ? C_CARD_HI : RGB(44, 38, 58), C_LINE);
+        drawText(dc, upR, L"+", C_CREAM, g_fontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        // Accent toggle
+        RECT acR = popAccRect();
+        COLORREF acBg = isAcc ? C_AMBER : ((g_pop.hot == PHOT_ACC) ? C_CARD_HI : RGB(44, 38, 58));
+        roundRectFill(dc, acR, 5, acBg, isAcc ? C_CREAM : C_LINE);
+        drawText(dc, acR, L"Acc", isAcc ? RGB(28, 20, 12) : C_MUTED, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        // Clear step
+        RECT clR = popClearRect();
+        roundRectFill(dc, clR, 5, (g_pop.hot == PHOT_CLEAR) ? RGB(92, 42, 58) : RGB(50, 34, 46), C_LINE);
+        drawText(dc, clR, L"x", C_ROSE, g_fontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        // Draw 7 white keys
+        for (int w = 0; w < 7; ++w) {
+            int pc = kWhitePC[w];
+            RECT kr = popWhiteKeyRect(w);
+            bool inSc   = (mask & (1u << pc)) != 0;
+            bool isSel  = isOn && (curPC == pc) && (curOct == g_pop.oct);
+            bool isHov  = (g_pop.hot == PHOT_KEY && g_pop.hotPC == pc);
+
+            COLORREF bg = isSel ? accent : (inSc ? RGB(236, 228, 220) : RGB(154, 146, 166));
+            if (isHov && !isSel) bg = mixColor(bg, accent, 0.35f);
+            COLORREF bd = isHov ? C_CREAM : RGB(28, 24, 38);
+            roundRectFill(dc, kr, 5, bg, bd);
+
+            if (inSc && !isSel && p.scale != SC_FREE) {
+                RECT dot = { (kr.left + kr.right) / 2 - 2, kr.bottom - 24, (kr.left + kr.right) / 2 + 3, kr.bottom - 19 };
+                fill(dc, dot, accent);
+            }
+            RECT lbl = { kr.left, kr.bottom - 18, kr.right, kr.bottom - 3 };
+            drawText(dc, lbl, kNoteNames[pc], isSel ? RGB(24, 16, 28) : RGB(44, 38, 56), g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        // Draw 5 black keys on top
+        for (int b = 0; b < 5; ++b) {
+            int pc = kBlackPC[b];
+            RECT kr = popBlackKeyRect(b);
+            bool inSc   = (mask & (1u << pc)) != 0;
+            bool isSel  = isOn && (curPC == pc) && (curOct == g_pop.oct);
+            bool isHov  = (g_pop.hot == PHOT_KEY && g_pop.hotPC == pc);
+
+            COLORREF bg = isSel ? accent : (inSc ? RGB(42, 36, 56) : RGB(24, 21, 32));
+            if (isHov && !isSel) bg = mixColor(bg, accent, 0.42f);
+            COLORREF bd = isHov ? C_CREAM : (isSel ? C_CREAM : RGB(18, 15, 24));
+            roundRectFill(dc, kr, 5, bg, bd);
+
+            if (inSc && !isSel && p.scale != SC_FREE) {
+                RECT dot = { (kr.left + kr.right) / 2 - 2, kr.bottom - 20, (kr.left + kr.right) / 2 + 3, kr.bottom - 15 };
+                fill(dc, dot, accent);
+            }
+            RECT lbl = { kr.left, kr.bottom - 15, kr.right, kr.bottom - 2 };
+            drawText(dc, lbl, kNoteNames[pc], isSel ? RGB(24, 16, 28) : (inSc ? C_CREAM : C_MUTED), g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        RECT ft = { pr.left + 10, pr.bottom - 22, pr.right - 10, pr.bottom - 4 };
+        drawText(dc, ft, L"Click: pick   Shift+Click: audition   Keys A-J: play", C_MUTED, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    } else if (g_pop.mode == POP_NOTE_POOL) {
+        int activeCount = countMaskBits(mask);
+        swprintf(buf, 64, L"Note Pool (%d)", activeCount);
+        RECT titleR = { pr.left + 10, pr.top + 6, pr.right - 188, pr.top + 30 };
+        drawText(dc, titleR, buf, C_AMBER, g_fontBold);
+
+        const wchar_t* pLbl[4] = { L"Min", L"Maj", L"Pnt", L"All" };
+        const int pSc[4] = { SC_MINOR, SC_MAJOR, SC_PENTA, SC_FREE };
+        const PopHot pH[4] = { PHOT_P_MIN, PHOT_P_MAJ, PHOT_P_PNT, PHOT_P_ALL };
+        for (int i = 0; i < 4; ++i) {
+            RECT r = popPoolPresetRect(i);
+            bool active = (p.scale == pSc[i]);
+            COLORREF bg = active ? RGB(66, 54, 42) : ((g_pop.hot == pH[i]) ? C_CARD_HI : RGB(44, 38, 58));
+            roundRectFill(dc, r, 5, bg, active ? C_AMBER : C_LINE);
+            drawText(dc, r, pLbl[i], active ? C_AMBER : C_MUTED, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        RECT dnR = popDoneRect();
+        roundRectFill(dc, dnR, 5, (g_pop.hot == PHOT_DONE) ? RGB(54, 88, 84) : RGB(42, 70, 68), C_MINT);
+        drawText(dc, dnR, L"Done", C_MINT, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        // White keys (toggle active notes)
+        for (int w = 0; w < 7; ++w) {
+            int pc = kWhitePC[w];
+            RECT kr = popWhiteKeyRect(w);
+            bool on    = (mask & (1u << pc)) != 0;
+            bool isHov = (g_pop.hot == PHOT_KEY && g_pop.hotPC == pc);
+
+            COLORREF bg = on ? RGB(238, 230, 222) : RGB(58, 52, 72);
+            if (isHov) bg = mixColor(bg, C_AMBER, 0.28f);
+            COLORREF bd = isHov ? C_CREAM : (on ? C_AMBER : RGB(34, 29, 44));
+            roundRectFill(dc, kr, 5, bg, bd);
+
+            if (on) {
+                RECT bar = { kr.left + 8, kr.bottom - 24, kr.right - 8, kr.bottom - 20 };
+                fill(dc, bar, (pc == p.rootKey) ? C_ROSE : C_MINT);
+            }
+            RECT lbl = { kr.left, kr.bottom - 18, kr.right, kr.bottom - 3 };
+            drawText(dc, lbl, kNoteNames[pc], on ? RGB(28, 22, 36) : C_MUTED, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        // Black keys (toggle active notes)
+        for (int b = 0; b < 5; ++b) {
+            int pc = kBlackPC[b];
+            RECT kr = popBlackKeyRect(b);
+            bool on    = (mask & (1u << pc)) != 0;
+            bool isHov = (g_pop.hot == PHOT_KEY && g_pop.hotPC == pc);
+
+            COLORREF bg = on ? RGB(74, 62, 92) : RGB(24, 20, 32);
+            if (isHov) bg = mixColor(bg, C_AMBER, 0.35f);
+            COLORREF bd = isHov ? C_CREAM : (on ? C_AMBER : RGB(18, 15, 24));
+            roundRectFill(dc, kr, 5, bg, bd);
+
+            if (on) {
+                RECT bar = { kr.left + 5, kr.bottom - 20, kr.right - 5, kr.bottom - 16 };
+                fill(dc, bar, (pc == p.rootKey) ? C_ROSE : C_MINT);
+            }
+            RECT lbl = { kr.left, kr.bottom - 15, kr.right, kr.bottom - 2 };
+            drawText(dc, lbl, kNoteNames[pc], on ? C_CREAM : RGB(92, 86, 108), g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        RECT ft = { pr.left + 10, pr.bottom - 22, pr.right - 10, pr.bottom - 4 };
+        drawText(dc, ft, L"Toggle exact notes for wheel, pitch-drag & Groove", C_MUTED, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
 static void paintUI(HDC dc) {
-    // Snapshot project & telemetry cleanly
     Project p;
     float scopeSnap[256];
     int scopeHead = 0;
@@ -1126,15 +1518,13 @@ static void paintUI(HDC dc) {
     RECT topLine = { 0, TOP_H - 1, g_client.right, TOP_H };
     fill(dc, topLine, C_LINE);
 
-    // Brand (left zone, zero overlap)
     RECT bR = { 16, 10, 190, 38 };
-    drawText(dc, bR, L"Ribbon 2.0", C_CREAM, g_fontBig);
+    drawText(dc, bR, L"Ribbon 2.1", C_CREAM, g_fontBig);
     RECT sR = { 18, 38, 190, 56 };
     drawText(dc, sR, L"win11 studio sketchpad", C_MUTED, g_fontTiny);
 
-    // Play/Stop button
     RECT pr = playRect();
-    COLORREF playBg = g_playing ? RGB(255, 148, 174) : C_ROSE;
+    COLORREF playBg = g_playing ? RGB(255, 148, 174) : (g_hot == HOT_PLAY ? RGB(255, 138, 166) : C_ROSE);
     roundRectFill(dc, pr, 36, playBg, C_ROSE);
     {
         HBRUSH b = CreateSolidBrush(RGB(28, 15, 22));
@@ -1155,56 +1545,51 @@ static void paintUI(HDC dc) {
         DeleteObject(b); DeleteObject(pen);
     }
 
-    // Tempo box
     wchar_t buf[128];
     RECT tr = tempoRect();
-    roundRectFill(dc, tr, 8, (g_hot == HOT_TEMPO) ? RGB(42, 36, 56) : C_CARD, C_LINE);
+    roundRectFill(dc, tr, 8, (g_hot == HOT_TEMPO) ? C_CARD_HI : C_CARD, C_LINE);
     RECT tl = { tr.left + 6, tr.top + 4, tr.right - 6, tr.top + 18 };
     drawText(dc, tl, L"TEMPO", C_MUTED, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     RECT tv = { tr.left + 4, tr.top + 18, tr.right - 4, tr.bottom - 4 };
     swprintf(buf, 64, L"%d BPM", p.tempo);
     drawText(dc, tv, buf, C_CREAM, g_fontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    // Swing box
     RECT swr = swingRect();
-    roundRectFill(dc, swr, 8, (g_hot == HOT_SWING) ? RGB(42, 36, 56) : C_CARD, C_LINE);
+    roundRectFill(dc, swr, 8, (g_hot == HOT_SWING) ? C_CARD_HI : C_CARD, C_LINE);
     RECT swl = { swr.left + 6, swr.top + 4, swr.right - 6, swr.top + 18 };
     drawText(dc, swl, L"SWING", C_MUTED, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     RECT swv = { swr.left + 4, swr.top + 18, swr.right - 4, swr.bottom - 4 };
     swprintf(buf, 64, L"%d%%", (int)(p.swing * 100.0f + 0.5f));
     drawText(dc, swv, buf, C_MINT, g_fontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    // Pattern A/B/C/D buttons
     const wchar_t* patLbl[4] = { L"A", L"B", L"C", L"D" };
     for (int i = 0; i < MAXPAT; ++i) {
         RECT r = patRect(i);
         bool isCur = (i == editPat);
         bool isPlayingPat = (g_playing && p.songMode && i == shownPat);
-        COLORREF bg = isCur ? RGB(66, 48, 86) : C_CARD;
+        bool hov = (g_hot == HOT_PAT && g_hotIdx == i);
+        COLORREF bg = isCur ? RGB(66, 48, 86) : (hov ? C_CARD_HI : C_CARD);
         COLORREF bd = isPlayingPat ? C_MINT : (isCur ? C_ROSE : C_LINE);
         roundRectFill(dc, r, 6, bg, bd, isPlayingPat ? 2 : 1);
         drawText(dc, r, patLbl[i], isCur ? C_CREAM : C_MUTED, g_fontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
-    // Song toggle
     RECT sgr = songRect();
-    roundRectFill(dc, sgr, 6, p.songMode ? RGB(44, 72, 70) : C_CARD, p.songMode ? C_MINT : C_LINE);
+    roundRectFill(dc, sgr, 6, p.songMode ? RGB(44, 72, 70) : (g_hot == HOT_SONG ? C_CARD_HI : C_CARD), p.songMode ? C_MINT : C_LINE);
     drawText(dc, sgr, L"SONG", p.songMode ? C_MINT : C_MUTED, g_fontSmall, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    // Right action buttons
-    roundRectFill(dc, presetRect(), 7, RGB(39, 34, 52), C_LINE);
+    roundRectFill(dc, presetRect(), 7, (g_hot == HOT_PRESET) ? C_CARD_HI : RGB(39, 34, 52), C_LINE);
     drawText(dc, presetRect(), kPresetNames[g_presetIdx], C_AMBER, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    roundRectFill(dc, openRect(), 7, RGB(37, 32, 48), C_LINE);
+    roundRectFill(dc, openRect(), 7, (g_hot == HOT_OPEN) ? C_CARD_HI : RGB(37, 32, 48), C_LINE);
     drawText(dc, openRect(), L"Open", C_CREAM, g_fontSmall, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    roundRectFill(dc, saveRect(), 7, RGB(37, 32, 48), C_LINE);
+    roundRectFill(dc, saveRect(), 7, (g_hot == HOT_SAVE) ? C_CARD_HI : RGB(37, 32, 48), C_LINE);
     drawText(dc, saveRect(), L"Save", C_CREAM, g_fontSmall, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    roundRectFill(dc, expRect(), 7, RGB(64, 34, 48), C_ROSE);
+    roundRectFill(dc, expRect(), 7, (g_hot == HOT_EXPORT) ? RGB(82, 42, 60) : RGB(64, 34, 48), C_ROSE);
     drawText(dc, expRect(), L"WAV", RGB(255, 224, 232), g_fontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    // Master slider & stereo peak meter
     RECT ml = { masterRect().left, 10, masterRect().right, 24 };
     swprintf(buf, 64, L"MASTER  %d%%", (int)(p.master * 100.0f + 0.5f));
     drawText(dc, ml, buf, C_MUTED, g_fontTiny);
@@ -1237,9 +1622,9 @@ static void paintUI(HDC dc) {
         RECT r = chanRowRect(c);
         bool sel = (c == g_sel);
         bool aud = isChannelAudible(p, c);
-        roundRectFill(dc, r, 8, sel ? RGB(44, 38, 58) : C_CARD, sel ? kKindColor[c] : C_LINE);
+        bool hov = (g_hot == HOT_CHANNEL && g_hotIdx == c);
+        roundRectFill(dc, r, 8, sel ? RGB(44, 38, 58) : (hov ? RGB(36, 31, 48) : C_CARD), sel ? kKindColor[c] : C_LINE);
 
-        // Color accent strip + trigger LED pulse
         RECT sw = { r.left + 6, r.top + 8, r.left + 10, r.bottom - 8 };
         fill(dc, sw, aud ? kKindColor[c] : RGB(75, 68, 88));
         if (pulse[c] > 0.12f) {
@@ -1252,7 +1637,6 @@ static void paintUI(HDC dc) {
         RECT sub = { r.left + 18, r.top + 21, r.right - 52, r.bottom - 3 };
         drawText(dc, sub, isDrum(c) ? L"drum" : L"synth", C_MUTED, g_fontTiny);
 
-        // Rail Mute & Solo buttons
         RECT rm = railMuteRect(c);
         bool muted = !p.ch[c].on;
         roundRectFill(dc, rm, 5, muted ? C_ROSE : RGB(33, 28, 44), C_LINE);
@@ -1269,7 +1653,6 @@ static void paintUI(HDC dc) {
     int gleft = gridLeft();
     int cw = cellW();
 
-    // Beat header bar
     for (int s = 0; s < STEPS; ++s) {
         int x = gleft + s * cw;
         RECT hr = { x, TOP_H + 6, x + cw - 4, TOP_H + 24 };
@@ -1295,20 +1678,38 @@ static void paintUI(HDC dc) {
 
         for (int s = 0; s < STEPS; ++s) {
             RECT r = cellRect(c, s);
-            bool on   = (curP.tr[c].steps & (1u << s)) != 0;
-            bool acc  = (curP.tr[c].accents & (1u << s)) != 0;
-            bool beat = (s % 4) == 0;
+            bool on      = (curP.tr[c].steps & (1u << s)) != 0;
+            bool acc     = (curP.tr[c].accents & (1u << s)) != 0;
+            bool beat    = (s % 4) == 0;
             bool playCol = (g_playing && s == shownStep && (!p.songMode || editPat == shownPat));
+            bool hov     = (!g_pop.open && g_hot == HOT_STEP && g_hotIdx == c && g_hotStep == s);
+            bool popTgt  = (g_pop.open && g_pop.mode == POP_STEP_NOTE && g_pop.ch == c && g_pop.step == s);
 
             COLORREF bg = on ? kKindColor[c] : (beat ? C_BEAT : C_CELL);
             if (!aud) bg = on ? RGB(74, 68, 86) : RGB(28, 25, 36);
-            COLORREF bd = playCol ? C_CREAM : (acc && on ? C_CREAM : (beat ? RGB(74, 66, 92) : C_LINE));
-            roundRectFill(dc, r, 6, bg, bd, (playCol || (acc && on)) ? 2 : 1);
+            else if (on && !acc) bg = mixColor(bg, RGB(24, 20, 32), 0.14f);
+            else if (!on && hov) bg = mixColor(bg, kKindColor[c], 0.16f);
+
+            COLORREF bd = playCol ? C_CREAM : (popTgt ? C_CREAM : (acc && on ? C_CREAM : (hov ? mixColor(C_LINE, kKindColor[c], 0.55f) : (beat ? RGB(74, 66, 92) : C_LINE))));
+            roundRectFill(dc, r, 6, bg, bd, (playCol || popTgt || (acc && on)) ? 2 : 1);
 
             if (on && !isDrum(c)) {
+                // Subtle accent top highlight
+                if (acc) {
+                    RECT bar = { r.left + 6, r.top + 2, r.right - 6, r.top + 4 };
+                    fill(dc, bar, C_CREAM);
+                }
+                // Subtle pitch-height micro-bar along bottom edge
+                float pitchFrac = (float)(curP.tr[c].off[s] - MIN_OFF) / (float)(MAX_OFF - MIN_OFF);
+                int maxW = std::max(4, (int)(r.right - r.left - 10));
+                int barW = std::max(3, (int)(maxW * std::clamp(pitchFrac, 0.0f, 1.0f)));
+                RECT pbar = { r.left + 5, r.bottom - 4, r.left + 5 + barW, r.bottom - 2 };
+                fill(dc, pbar, RGB(28, 20, 36));
+
                 wchar_t nbuf[16];
                 midiNoteName(channelRootMidi(c) + curP.tr[c].off[s], nbuf, 16);
-                drawText(dc, r, nbuf, RGB(24, 18, 30), g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                RECT trTxt = { r.left, r.top, r.right, r.bottom - 2 };
+                drawText(dc, trTxt, nbuf, RGB(24, 18, 30), g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             } else if (on && acc) {
                 RECT dot = { (r.left + r.right) / 2 - 2, (r.top + r.bottom) / 2 - 2,
                              (r.left + r.right) / 2 + 3, (r.top + r.bottom) / 2 + 3 };
@@ -1318,7 +1719,6 @@ static void paintUI(HDC dc) {
     }
 
     // ---- Bottom Inspector Cards ----
-    // Card 1: Selected Track Controls
     RECT c1 = cardTrackRect();
     roundRectFill(dc, c1, 10, C_CARD, C_LINE);
     const ChannelMix& selCh = p.ch[g_sel];
@@ -1327,10 +1727,10 @@ static void paintUI(HDC dc) {
     swprintf(buf, 64, L"%s  (%s)", kKindName[g_sel], isDrum(g_sel) ? L"drum" : L"synth");
     drawText(dc, c1t, buf, kKindColor[g_sel], g_fontBold);
 
-    roundRectFill(dc, inspClearRect(), 6, RGB(40, 34, 52), C_LINE);
+    roundRectFill(dc, inspClearRect(), 6, (g_hot == HOT_CLEAR_CH) ? C_CARD_HI : RGB(40, 34, 52), C_LINE);
     drawText(dc, inspClearRect(), L"Clear", C_MUTED, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    roundRectFill(dc, inspGrooveRect(), 6, RGB(42, 38, 60), C_MINT);
+    roundRectFill(dc, inspGrooveRect(), 6, (g_hot == HOT_GROOVE_CH) ? RGB(50, 46, 72) : RGB(42, 38, 60), C_MINT);
     drawText(dc, inspGrooveRect(), L"Groove", C_MINT, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     roundRectFill(dc, inspMuteRect(), 6, !selCh.on ? C_ROSE : RGB(40, 34, 52), C_LINE);
@@ -1350,7 +1750,7 @@ static void paintUI(HDC dc) {
         RECT vr = { sr.right + 6, sr.top - 2, c1.right - 8, sr.bottom + 2 };
         if (i == 1) {
             int pv = (int)(selCh.pan * 100.0f);
-            if (abs(pv) < 4) wcscpy(buf, L"C");
+            if (std::abs(pv) < 4) wcscpy(buf, L"C");
             else if (pv < 0) swprintf(buf, 32, L"L%d", -pv);
             else swprintf(buf, 32, L"R%d", pv);
         } else {
@@ -1359,11 +1759,11 @@ static void paintUI(HDC dc) {
         drawText(dc, vr, buf, C_CREAM, g_fontTiny, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
 
-    // Card 2: Master FX & Scale
+    // Card 2: Master FX & Key / Scale / Custom Notes
     RECT c2 = cardFxRect();
     roundRectFill(dc, c2, 10, C_CARD, C_LINE);
     RECT c2t = { c2.left + 14, c2.top + 10, c2.right - 14, c2.top + 36 };
-    drawText(dc, c2t, L"Master FX & Key", C_CREAM, g_fontBold);
+    drawText(dc, c2t, L"Master FX & Notes", C_CREAM, g_fontBold);
 
     const wchar_t* fxLbl[2] = { L"Reverb", L"Delay" };
     float fxVal[2] = { p.reverbMix, p.delayMix };
@@ -1378,16 +1778,32 @@ static void paintUI(HDC dc) {
         drawText(dc, vr, buf, C_CREAM, g_fontTiny, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
 
+    // Key | Scale | Notes pill row
+    RECT rkR = rootKeyBtnRect();
+    bool keyDim = (p.scale == SC_FREE || p.scale == SC_CUSTOM);
+    roundRectFill(dc, rkR, 6, (g_hot == HOT_ROOT_KEY) ? C_CARD_HI : RGB(40, 35, 54), C_LINE);
+    drawText(dc, rkR, keyDim ? L"--" : kNoteNames[p.rootKey % 12], keyDim ? C_MUTED : C_CREAM, g_fontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
     RECT scR = scaleBtnRect();
-    roundRectFill(dc, scR, 6, RGB(40, 35, 54), C_LINE);
-    swprintf(buf, 64, L"Scale: %s  (click)", kScaleName[p.scale]);
-    drawText(dc, scR, buf, C_AMBER, g_fontSmall, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    roundRectFill(dc, scR, 6, (g_hot == HOT_SCALE) ? C_CARD_HI : RGB(40, 35, 54), (p.scale == SC_FREE) ? C_MINT : C_LINE);
+    if (p.scale == SC_CUSTOM) {
+        swprintf(buf, 64, L"Custom (%d)", countMaskBits(effectiveNoteMask(p)));
+    } else {
+        swprintf(buf, 64, L"%s", kScaleName[p.scale]);
+    }
+    drawText(dc, scR, buf, (p.scale == SC_FREE) ? C_MINT : C_AMBER, g_fontSmall, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    RECT npR = notePoolBtnRect();
+    bool poolOpen = (g_pop.open && g_pop.mode == POP_NOTE_POOL);
+    roundRectFill(dc, npR, 6, poolOpen ? RGB(64, 52, 42) : ((g_hot == HOT_NOTE_POOL) ? C_CARD_HI : RGB(42, 37, 58)), poolOpen ? C_AMBER : C_LINE);
+    drawText(dc, npR, L"Notes", poolOpen ? C_AMBER : C_CREAM, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     const wchar_t* uLbl[3] = { L"Copy Pat", L"Paste", L"Undo" };
+    const Hot uHot[3] = { HOT_COPY, HOT_PASTE, HOT_UNDO };
     for (int i = 0; i < 3; ++i) {
         RECT ur = utilBtnRect(i);
         bool dim = (i == 1 && !g_hasClipboard) || (i == 2 && g_undoStack.empty());
-        roundRectFill(dc, ur, 6, RGB(37, 32, 48), C_LINE);
+        roundRectFill(dc, ur, 6, (!dim && g_hot == uHot[i]) ? C_CARD_HI : RGB(37, 32, 48), C_LINE);
         drawText(dc, ur, uLbl[i], dim ? RGB(92, 86, 108) : C_CREAM, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
@@ -1424,8 +1840,24 @@ static void paintUI(HDC dc) {
 
     RECT scHint = { c3.left + 14, c3.bottom - 28, c3.right - 14, c3.bottom - 6 };
     drawText(dc, scHint,
-             isDrum(g_sel) ? L"Alt+Click: accent   Drag: paint" : L"Right-Click / Wheel: pitch   Alt: accent",
+             isDrum(g_sel) ? L"Alt+Click: accent   Drag: paint"
+                           : L"Right-Click: piano   Drag up/dn or Wheel: pitch",
              C_MUTED, g_fontTiny, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    // ---- Floating Pitch-Glide Pill (during vertical drag on an active step) ----
+    if (g_drag == DRAG_PITCH && !isDrum(g_dragCh)) {
+        RECT cr = cellRect(g_dragCh, g_dragStep);
+        int cx = (cr.left + cr.right) / 2;
+        int py = std::max(TOP_H + 8, (int)cr.top - 30);
+        RECT pill = { cx - 28, py, cx + 28, py + 24 };
+        roundRectFill(dc, pill, 10, RGB(24, 20, 34), kKindColor[g_dragCh], 2);
+        wchar_t nbuf[16];
+        midiNoteName(channelRootMidi(g_dragCh) + curP.tr[g_dragCh].off[g_dragStep], nbuf, 16);
+        drawText(dc, pill, nbuf, kKindColor[g_dragCh], g_fontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // ---- Floating 12-Key Popover (on top of grid & cards) ----
+    paintPopover(dc, p);
 
     // ---- Footer ----
     RECT foot = { 0, g_client.bottom - FOOT_H, g_client.right, g_client.bottom };
@@ -1435,7 +1867,7 @@ static void paintUI(HDC dc) {
         drawText(dc, ft, g_toastText, C_MINT, g_fontSmall);
     } else {
         swprintf(buf, 128,
-            L"%s  |  Pat %s%s  |  Space: Play  |  Drag cells: Paint  |  Right-Click/Wheel: Note  |  Ctrl+Z: Undo",
+            L"%s  |  Pat %s%s  |  Right-Click cell: Piano  |  Drag vertical / Wheel: Pitch  |  Ctrl+Z: Undo",
             g_playing ? L"Playing" : L"Ready",
             patLbl[editPat],
             p.songMode ? L" (Song A-D)" : L"");
@@ -1452,8 +1884,30 @@ static void redraw() {
 //  Hit Testing & Slider Helpers
 // ---------------------------------------------------------------------------
 
-static inline bool inRect(RECT r, int x, int y) {
-    return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+static void hitTestPopover(int x, int y, PopHot& hot, int& pc) {
+    hot = PHOT_NONE; pc = -1;
+    if (!g_pop.open || !inRect(g_pop.rect, x, y)) return;
+
+    if (g_pop.mode == POP_STEP_NOTE) {
+        if (inRect(popOctDnRect(), x, y)) { hot = PHOT_OCT_DN; return; }
+        if (inRect(popOctUpRect(), x, y)) { hot = PHOT_OCT_UP; return; }
+        if (inRect(popAccRect(), x, y))   { hot = PHOT_ACC; return; }
+        if (inRect(popClearRect(), x, y)) { hot = PHOT_CLEAR; return; }
+    } else if (g_pop.mode == POP_NOTE_POOL) {
+        const PopHot pH[4] = { PHOT_P_MIN, PHOT_P_MAJ, PHOT_P_PNT, PHOT_P_ALL };
+        for (int i = 0; i < 4; ++i) {
+            if (inRect(popPoolPresetRect(i), x, y)) { hot = pH[i]; return; }
+        }
+        if (inRect(popDoneRect(), x, y)) { hot = PHOT_DONE; return; }
+    }
+
+    // Black keys take priority over white keys
+    for (int b = 0; b < 5; ++b) {
+        if (inRect(popBlackKeyRect(b), x, y)) { hot = PHOT_KEY; pc = kBlackPC[b]; return; }
+    }
+    for (int w = 0; w < 7; ++w) {
+        if (inRect(popWhiteKeyRect(w), x, y)) { hot = PHOT_KEY; pc = kWhitePC[w]; return; }
+    }
 }
 
 static void hitTest(int x, int y, Hot& hot, int& idx, int& step) {
@@ -1491,12 +1945,14 @@ static void hitTest(int x, int y, Hot& hot, int& idx, int& step) {
     if (inRect(trackSliderRect(2), x, y)) { hot = HOT_TONE; return; }
     if (inRect(trackSliderRect(3), x, y)) { hot = HOT_DECAY; return; }
 
-    if (inRect(fxSliderRect(0), x, y)) { hot = HOT_REVERB; return; }
-    if (inRect(fxSliderRect(1), x, y)) { hot = HOT_DELAY; return; }
-    if (inRect(scaleBtnRect(), x, y))  { hot = HOT_SCALE; return; }
-    if (inRect(utilBtnRect(0), x, y))  { hot = HOT_COPY; return; }
-    if (inRect(utilBtnRect(1), x, y))  { hot = HOT_PASTE; return; }
-    if (inRect(utilBtnRect(2), x, y))  { hot = HOT_UNDO; return; }
+    if (inRect(fxSliderRect(0), x, y))  { hot = HOT_REVERB; return; }
+    if (inRect(fxSliderRect(1), x, y))  { hot = HOT_DELAY; return; }
+    if (inRect(rootKeyBtnRect(), x, y)) { hot = HOT_ROOT_KEY; return; }
+    if (inRect(scaleBtnRect(), x, y))   { hot = HOT_SCALE; return; }
+    if (inRect(notePoolBtnRect(), x, y)){ hot = HOT_NOTE_POOL; return; }
+    if (inRect(utilBtnRect(0), x, y))   { hot = HOT_COPY; return; }
+    if (inRect(utilBtnRect(1), x, y))   { hot = HOT_PASTE; return; }
+    if (inRect(utilBtnRect(2), x, y))   { hot = HOT_UNDO; return; }
 }
 
 static float sliderFrac(RECT r, int x) {
@@ -1520,7 +1976,7 @@ static void applySliderDrag(DragMode dm, int x) {
 }
 
 // ---------------------------------------------------------------------------
-//  File I/O (RIBBON 2 + backward-compatible RIBBON 1 + Offline WAV Export)
+//  File I/O (Backward-compatible RIBBON 1 & 2 + Offline WAV Export)
 // ---------------------------------------------------------------------------
 
 static bool loadProjectFromPath(const wchar_t* path) {
@@ -1536,6 +1992,7 @@ static bool loadProjectFromPath(const wchar_t* path) {
 
     Project np;
     resetMixDefaults(np);
+    bool hasKeyLine = false;
     wchar_t key[32];
     while (fwscanf(f, L"%31s", key) == 1) {
         if (wcscmp(key, L"tempo") == 0) {
@@ -1544,6 +2001,13 @@ static bool loadProjectFromPath(const wchar_t* path) {
             double s = 0.0; if (fwscanf(f, L"%lf", &s) == 1) np.swing = (float)std::clamp(s, 0.0, 0.60);
         } else if (wcscmp(key, L"scale") == 0) {
             int sc = 0; if (fwscanf(f, L"%d", &sc) == 1) np.scale = std::clamp(sc, 0, NSCALE - 1);
+        } else if (wcscmp(key, L"key") == 0) {
+            int rk = 0; unsigned cm = 0x5ADu;
+            if (fwscanf(f, L"%d %u", &rk, &cm) == 2) {
+                np.rootKey = ((rk % 12) + 12) % 12;
+                np.customMask = (cm & 0xFFFu) ? (cm & 0xFFFu) : 1u;
+                hasKeyLine = true;
+            }
         } else if (wcscmp(key, L"master") == 0) {
             double m = 0.84; if (fwscanf(f, L"%lf", &m) == 1) np.master = (float)std::clamp(m, 0.0, 1.0);
         } else if (wcscmp(key, L"fx") == 0) {
@@ -1580,12 +2044,11 @@ static bool loadProjectFromPath(const wchar_t* path) {
                     np.pat[pi].tr[ch].accents = ac;
                     for (int s = 0; s < STEPS; ++s) {
                         int o = 0;
-                        if (fwscanf(f, L"%d", &o) == 1) np.pat[pi].tr[ch].off[s] = (signed char)std::clamp(o, -24, 24);
+                        if (fwscanf(f, L"%d", &o) == 1) np.pat[pi].tr[ch].off[s] = (signed char)std::clamp(o, MIN_OFF, MAX_OFF);
                     }
                 }
             }
         } else if (wcscmp(key, L"ch") == 0) {
-            // Backward compatibility with RIBBON 1 files
             int idx = -1, kind = 0;
             unsigned st = 0;
             double vol = 0.75, pan = 0.0;
@@ -1596,7 +2059,7 @@ static bool loadProjectFromPath(const wchar_t* path) {
                     np.pat[0].tr[idx].steps = st;
                     for (int s = 0; s < STEPS; ++s) {
                         int o = 0;
-                        if (fwscanf(f, L"%d", &o) == 1) np.pat[0].tr[idx].off[s] = (signed char)std::clamp(o, -24, 24);
+                        if (fwscanf(f, L"%d", &o) == 1) np.pat[0].tr[idx].off[s] = (signed char)std::clamp(o, MIN_OFF, MAX_OFF);
                     }
                 }
             }
@@ -1604,6 +2067,8 @@ static bool loadProjectFromPath(const wchar_t* path) {
     }
     fclose(f);
 
+    if (!hasKeyLine) np.customMask = buildScaleMask(np.scale, np.rootKey);
+    closePopover();
     pushUndo();
     EnterCriticalSection(&g_cs);
     g_proj = np;
@@ -1635,6 +2100,7 @@ static void saveProject() {
     fwprintf(f, L"tempo %d\n", p.tempo);
     fwprintf(f, L"swing %.3f\n", p.swing);
     fwprintf(f, L"scale %d\n", p.scale);
+    fwprintf(f, L"key %d %u\n", p.rootKey, p.customMask & 0xFFFu);
     fwprintf(f, L"master %.3f\n", p.master);
     fwprintf(f, L"fx %.3f %.3f\n", p.reverbMix, p.delayMix);
     fwprintf(f, L"mode %d %d\n", p.curPat, p.songMode ? 1 : 0);
@@ -1681,17 +2147,16 @@ static void exportWav() {
     ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return;
 
-    // Take an isolated snapshot + dedicated offline SynthEngine (zero interference with live playback!)
     EnterCriticalSection(&g_cs);
     Project p = g_proj;
     LeaveCriticalSection(&g_cs);
 
     std::unique_ptr<SynthEngine> eng(new SynthEngine());
-    const int numBars = 4; // 4 bars of current pattern, OR full Song A->B->C->D
+    const int numBars = 4;
     const int totalSteps = numBars * STEPS;
     int activeFrames = 0;
     for (int s = 0; s < totalSteps; ++s) activeFrames += calcStepSamples(p.tempo, p.swing, s % STEPS);
-    const int tailFrames = SR * 2; // 2-second reverb/delay decay tail
+    const int tailFrames = SR * 2;
     const int totalFrames = activeFrames + tailFrames;
 
     std::vector<short> out((size_t)totalFrames * 2);
@@ -1736,11 +2201,11 @@ static void exportWav() {
     setToast(p.songMode ? L"Exported 4-bar Song (A-D) WAV" : L"Exported 4-bar Pattern WAV", 3500);
     MessageBoxW(g_main,
                 p.songMode ? L"WAV exported (Full Song A-D + FX tail)." : L"WAV exported (4 bars + FX tail).",
-                L"Ribbon 2.0", MB_OK | MB_ICONINFORMATION);
+                L"Ribbon 2.1", MB_OK | MB_ICONINFORMATION);
 }
 
 // ---------------------------------------------------------------------------
-//  Windows 11 Dark Title Bar & Per-Monitor V2 DPI (Dynamic loading -> zero link errors)
+//  Windows 11 Dark Title Bar & Per-Monitor V2 DPI
 // ---------------------------------------------------------------------------
 
 static void enableDpiAwareness() {
@@ -1749,7 +2214,7 @@ static void enableDpiAwareness() {
     typedef BOOL (WINAPI *FnSetDpiCtx)(HANDLE);
     auto fn = (FnSetDpiCtx)GetProcAddress(u32, "SetProcessDpiAwarenessContext");
     if (fn) {
-        fn((HANDLE)(LONG_PTR)-4); // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        fn((HANDLE)(LONG_PTR)-4);
     }
 }
 
@@ -1760,10 +2225,10 @@ static void applyWin11DarkTitleBar(HWND hwnd) {
     auto fn = (FnDwmSetAttr)GetProcAddress(dwm, "DwmSetWindowAttribute");
     if (fn) {
         BOOL dark = TRUE;
-        fn(hwnd, 20, &dark, sizeof(dark)); // DWMWA_USE_IMMERSIVE_DARK_MODE (Win11 / Win10 20H1+)
-        fn(hwnd, 19, &dark, sizeof(dark)); // Fallback older Win10
+        fn(hwnd, 20, &dark, sizeof(dark));
+        fn(hwnd, 19, &dark, sizeof(dark));
         COLORREF cap = C_TOP;
-        fn(hwnd, 35, &cap, sizeof(cap));   // DWMWA_CAPTION_COLOR (Win11)
+        fn(hwnd, 35, &cap, sizeof(cap));
     }
     FreeLibrary(dwm);
 }
@@ -1777,7 +2242,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
         GetClientRect(hwnd, &g_client);
         applyWin11DarkTitleBar(hwnd);
-        SetTimer(hwnd, 1, 25, NULL); // 40 FPS smooth scope, meter & playhead
+        SetTimer(hwnd, 1, 25, NULL);
         return 0;
 
     case WM_GETMINMAXINFO: {
@@ -1789,6 +2254,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_SIZE:
         GetClientRect(hwnd, &g_client);
+        if (g_pop.open) {
+            if (g_pop.mode == POP_STEP_NOTE) g_pop.rect = calcClampedPopRect(cellRect(g_pop.ch, g_pop.step), true);
+            else if (g_pop.mode == POP_NOTE_POOL) g_pop.rect = calcClampedPopRect(scaleBtnRect(), true);
+        }
         InvalidateRect(hwnd, NULL, FALSE);
         return 0;
 
@@ -1818,6 +2287,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+
         if (g_drag != DRAG_NONE) {
             if (g_drag == DRAG_TEMPO) {
                 int t = std::clamp(g_dragTempo0 + (g_dragY0 - y) / 2, 40, 240);
@@ -1825,6 +2295,49 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (g_drag == DRAG_SWING) {
                 float s = std::clamp(g_dragSwing0 + (float)(g_dragY0 - y) * 0.004f, 0.0f, 0.60f);
                 EnterCriticalSection(&g_cs); g_proj.swing = s; LeaveCriticalSection(&g_cs);
+            } else if (g_drag == DRAG_STEP_MAYBE) {
+                int dx = x - g_dragX0;
+                int dy = g_dragY0 - y;
+                Hot h2; int c2, s2;
+                hitTest(x, y, h2, c2, s2);
+                if (std::abs(dy) >= 6 && std::abs(dy) >= std::abs(dx)) {
+                    // Vertical drag -> pitch glide!
+                    pushUndo();
+                    g_drag = DRAG_PITCH;
+                    g_dragLastStep = 0;
+                    SetCursor(LoadCursor(NULL, IDC_SIZENS));
+                } else if (h2 == HOT_STEP && (c2 != g_dragCh || s2 != g_dragStep)) {
+                    // Horizontal drag into another cell -> paint off!
+                    pushUndo();
+                    EnterCriticalSection(&g_cs);
+                    unsigned m0 = 1u << g_dragStep;
+                    g_proj.pat[g_proj.curPat].tr[g_dragCh].steps   &= ~m0;
+                    g_proj.pat[g_proj.curPat].tr[g_dragCh].accents &= ~m0;
+                    unsigned m2 = 1u << s2;
+                    g_proj.pat[g_proj.curPat].tr[c2].steps   &= ~m2;
+                    g_proj.pat[g_proj.curPat].tr[c2].accents &= ~m2;
+                    LeaveCriticalSection(&g_cs);
+                    g_drag = DRAG_PAINT_OFF;
+                }
+            } else if (g_drag == DRAG_PITCH) {
+                int stepsDelta = (g_dragY0 - y) / 10;
+                if (stepsDelta != g_dragLastStep) {
+                    bool chrom = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                    int dir = (stepsDelta > g_dragLastStep) ? 1 : -1;
+                    int count = std::abs(stepsDelta - g_dragLastStep);
+                    bool changed = false;
+                    EnterCriticalSection(&g_cs);
+                    PatternTrack& tr = g_proj.pat[g_proj.curPat].tr[g_dragCh];
+                    int cur = tr.off[g_dragStep];
+                    for (int k = 0; k < count; ++k) cur = stepNoteOffset(g_proj, cur, dir, chrom);
+                    if (cur != tr.off[g_dragStep]) {
+                        tr.off[g_dragStep] = (signed char)cur;
+                        changed = true;
+                    }
+                    LeaveCriticalSection(&g_cs);
+                    g_dragLastStep = stepsDelta;
+                    if (changed) previewChannelStep(g_dragCh, g_dragStep);
+                }
             } else if (g_drag == DRAG_PAINT_ON || g_drag == DRAG_PAINT_OFF) {
                 Hot h2; int c2, s2;
                 hitTest(x, y, h2, c2, s2);
@@ -1838,7 +2351,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         LeaveCriticalSection(&g_cs);
                         previewChannelStep(c2, s2);
                     } else if (g_drag == DRAG_PAINT_OFF && wasOn) {
-                        g_proj.pat[g_proj.curPat].tr[c2].steps &= ~mask;
+                        g_proj.pat[g_proj.curPat].tr[c2].steps   &= ~mask;
                         g_proj.pat[g_proj.curPat].tr[c2].accents &= ~mask;
                         LeaveCriticalSection(&g_cs);
                     } else {
@@ -1849,6 +2362,18 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 applySliderDrag(g_drag, x);
             }
             redraw();
+            return 0;
+        }
+
+        if (g_pop.open) {
+            PopHot ph; int ppc;
+            hitTestPopover(x, y, ph, ppc);
+            if (ph != g_pop.hot || ppc != g_pop.hotPC) {
+                g_pop.hot = ph;
+                g_pop.hotPC = ppc;
+                SetCursor(LoadCursor(NULL, (ph != PHOT_NONE) ? IDC_HAND : IDC_ARROW));
+                redraw();
+            }
             return 0;
         }
 
@@ -1867,9 +2392,63 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool alt   = (GetKeyState(VK_MENU)  & 0x8000) != 0;
+
+        // Handle clicks when floating 12-key popover is open
+        if (g_pop.open) {
+            if (!inRect(g_pop.rect, x, y)) {
+                closePopover();
+                redraw();
+                return 0;
+            }
+            PopHot ph; int pc;
+            hitTestPopover(x, y, ph, pc);
+            if (g_pop.mode == POP_STEP_NOTE) {
+                int baseOct = channelBaseOct(g_pop.ch);
+                if (ph == PHOT_KEY && pc >= 0) {
+                    assignStepPitchClass(pc, !shift);
+                } else if (ph == PHOT_OCT_DN) {
+                    g_pop.oct = std::max(baseOct - 2, g_pop.oct - 1);
+                } else if (ph == PHOT_OCT_UP) {
+                    g_pop.oct = std::min(baseOct + 2, g_pop.oct + 1);
+                } else if (ph == PHOT_ACC) {
+                    pushUndo();
+                    EnterCriticalSection(&g_cs);
+                    PatternTrack& tr = g_proj.pat[g_proj.curPat].tr[g_pop.ch];
+                    tr.steps |= (1u << g_pop.step);
+                    tr.accents ^= (1u << g_pop.step);
+                    LeaveCriticalSection(&g_cs);
+                    previewChannelStep(g_pop.ch, g_pop.step);
+                } else if (ph == PHOT_CLEAR) {
+                    pushUndo();
+                    EnterCriticalSection(&g_cs);
+                    PatternTrack& tr = g_proj.pat[g_proj.curPat].tr[g_pop.ch];
+                    tr.steps   &= ~(1u << g_pop.step);
+                    tr.accents &= ~(1u << g_pop.step);
+                    LeaveCriticalSection(&g_cs);
+                    closePopover();
+                }
+            } else if (g_pop.mode == POP_NOTE_POOL) {
+                if (ph == PHOT_KEY && pc >= 0) {
+                    togglePoolNote(pc);
+                } else if (ph == PHOT_P_MIN || ph == PHOT_P_MAJ || ph == PHOT_P_PNT || ph == PHOT_P_ALL) {
+                    int sc = (ph == PHOT_P_MIN) ? SC_MINOR : (ph == PHOT_P_MAJ) ? SC_MAJOR : (ph == PHOT_P_PNT) ? SC_PENTA : SC_FREE;
+                    pushUndo();
+                    EnterCriticalSection(&g_cs);
+                    g_proj.scale = sc;
+                    g_proj.customMask = buildScaleMask(sc, g_proj.rootKey);
+                    LeaveCriticalSection(&g_cs);
+                } else if (ph == PHOT_DONE) {
+                    closePopover();
+                }
+            }
+            redraw();
+            return 0;
+        }
+
         Hot hot; int idx, step;
         hitTest(x, y, hot, idx, step);
-        bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
 
         switch (hot) {
         case HOT_PLAY:   togglePlay(); break;
@@ -1912,29 +2491,46 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             EnterCriticalSection(&g_cs); g_proj.ch[idx].solo = !g_proj.ch[idx].solo; LeaveCriticalSection(&g_cs);
             break;
         case HOT_STEP: {
-            pushUndo();
             g_sel = idx;
             unsigned mask = 1u << step;
             EnterCriticalSection(&g_cs);
             PatternTrack& tr = g_proj.pat[g_proj.curPat].tr[idx];
+            bool wasOn = (tr.steps & mask) != 0;
+            int origOff = tr.off[step];
+            LeaveCriticalSection(&g_cs);
+
             if (alt) {
-                tr.steps |= mask;
-                tr.accents ^= mask;
+                pushUndo();
+                EnterCriticalSection(&g_cs);
+                g_proj.pat[g_proj.curPat].tr[idx].steps   |= mask;
+                g_proj.pat[g_proj.curPat].tr[idx].accents ^= mask;
                 LeaveCriticalSection(&g_cs);
                 previewChannelStep(idx, step);
-            } else {
-                bool nowOn = !(tr.steps & mask);
-                if (nowOn) {
-                    tr.steps |= mask;
-                    g_drag = DRAG_PAINT_ON;
-                } else {
-                    tr.steps &= ~mask;
-                    tr.accents &= ~mask;
-                    g_drag = DRAG_PAINT_OFF;
-                }
+            } else if (!wasOn) {
+                pushUndo();
+                EnterCriticalSection(&g_cs);
+                g_proj.pat[g_proj.curPat].tr[idx].steps |= mask;
                 LeaveCriticalSection(&g_cs);
+                g_drag = DRAG_PAINT_ON;
                 SetCapture(hwnd);
-                if (nowOn) previewChannelStep(idx, step);
+                previewChannelStep(idx, step);
+            } else if (!isDrum(idx)) {
+                // Active melodic step: click toggles off, vertical drag glides pitch, horizontal drag paints off
+                g_drag     = DRAG_STEP_MAYBE;
+                g_dragX0   = x;
+                g_dragY0   = y;
+                g_dragCh   = idx;
+                g_dragStep = step;
+                g_dragOff0 = origOff;
+                SetCapture(hwnd);
+            } else {
+                pushUndo();
+                EnterCriticalSection(&g_cs);
+                g_proj.pat[g_proj.curPat].tr[idx].steps   &= ~mask;
+                g_proj.pat[g_proj.curPat].tr[idx].accents &= ~mask;
+                LeaveCriticalSection(&g_cs);
+                g_drag = DRAG_PAINT_OFF;
+                SetCapture(hwnd);
             }
             break;
         }
@@ -1961,15 +2557,31 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case HOT_GROOVE_CH:
             generateSmartGroove(g_sel);
             break;
+        case HOT_ROOT_KEY:
+            EnterCriticalSection(&g_cs);
+            g_proj.rootKey = (g_proj.rootKey + 1) % 12;
+            if (g_proj.scale == SC_CUSTOM || g_proj.scale == SC_FREE) g_proj.scale = SC_MINOR;
+            LeaveCriticalSection(&g_cs);
+            {
+                wchar_t b[64];
+                swprintf(b, 64, L"Key set to %s %s", kNoteNames[g_proj.rootKey], kScaleName[g_proj.scale]);
+                setToast(b);
+            }
+            break;
         case HOT_SCALE:
             EnterCriticalSection(&g_cs);
             g_proj.scale = (g_proj.scale + 1) % NSCALE;
             LeaveCriticalSection(&g_cs);
             {
                 wchar_t b[64];
-                swprintf(b, 64, L"Scale set to %s", kScaleName[g_proj.scale]);
+                if (g_proj.scale == SC_FREE) wcscpy(b, L"Scale: Free (all 12 notes unlocked)");
+                else if (g_proj.scale == SC_CUSTOM) swprintf(b, 64, L"Scale: Custom (%d notes) - click Notes to edit", countMaskBits(effectiveNoteMask(g_proj)));
+                else swprintf(b, 64, L"Scale: %s %s", kNoteNames[g_proj.rootKey], kScaleName[g_proj.scale]);
                 setToast(b);
             }
+            break;
+        case HOT_NOTE_POOL:
+            openNotePoolPopover();
             break;
         case HOT_COPY:
             EnterCriticalSection(&g_cs);
@@ -1997,14 +2609,27 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_LBUTTONUP:
-        if (g_drag != DRAG_NONE) {
+        if (g_drag == DRAG_STEP_MAYBE) {
+            // Simple click without dragging -> toggle step off
+            pushUndo();
+            EnterCriticalSection(&g_cs);
+            unsigned mask = 1u << g_dragStep;
+            g_proj.pat[g_proj.curPat].tr[g_dragCh].steps   &= ~mask;
+            g_proj.pat[g_proj.curPat].tr[g_dragCh].accents &= ~mask;
+            LeaveCriticalSection(&g_cs);
             g_drag = DRAG_NONE;
             ReleaseCapture();
+            redraw();
+        } else if (g_drag != DRAG_NONE) {
+            g_drag = DRAG_NONE;
+            ReleaseCapture();
+            redraw();
         }
         return 0;
 
     case WM_MBUTTONDOWN: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        if (g_pop.open) { closePopover(); redraw(); return 0; }
         Hot hot; int idx, step;
         hitTest(x, y, hot, idx, step);
         if (hot == HOT_STEP) {
@@ -2012,7 +2637,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_sel = idx;
             unsigned mask = 1u << step;
             EnterCriticalSection(&g_cs);
-            g_proj.pat[g_proj.curPat].tr[idx].steps |= mask;
+            g_proj.pat[g_proj.curPat].tr[idx].steps   |= mask;
             g_proj.pat[g_proj.curPat].tr[idx].accents ^= mask;
             LeaveCriticalSection(&g_cs);
             previewChannelStep(idx, step);
@@ -2023,25 +2648,37 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_RBUTTONDOWN: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+
+        if (g_pop.open) {
+            if (inRect(g_pop.rect, x, y)) {
+                PopHot ph; int pc;
+                hitTestPopover(x, y, ph, pc);
+                if (g_pop.mode == POP_STEP_NOTE && ph == PHOT_KEY && pc >= 0) {
+                    // Right-click a piano key -> audition & assign without closing
+                    assignStepPitchClass(pc, false);
+                    redraw();
+                }
+                return 0;
+            }
+            closePopover();
+        }
+
         Hot hot; int idx, step;
         hitTest(x, y, hot, idx, step);
         if (hot == HOT_STEP) {
-            pushUndo();
             g_sel = idx;
             if (!isDrum(idx)) {
-                int dir = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
-                EnterCriticalSection(&g_cs);
-                PatternTrack& tr = g_proj.pat[g_proj.curPat].tr[idx];
-                tr.steps |= (1u << step);
-                tr.off[step] = (signed char)stepScaleOffset(g_proj.scale, tr.off[step], dir);
-                LeaveCriticalSection(&g_cs);
-                previewChannelStep(idx, step);
+                openStepNotePopover(idx, step);
             } else {
+                pushUndo();
                 EnterCriticalSection(&g_cs);
                 g_proj.pat[g_proj.curPat].tr[idx].steps   &= ~(1u << step);
                 g_proj.pat[g_proj.curPat].tr[idx].accents &= ~(1u << step);
                 LeaveCriticalSection(&g_cs);
             }
+            redraw();
+        } else if (hot == HOT_SCALE || hot == HOT_ROOT_KEY) {
+            openNotePoolPopover();
             redraw();
         }
         return 0;
@@ -2050,8 +2687,18 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
         int dir = (delta > 0) ? 1 : -1;
+        bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool shift = (GetKeyState(VK_SHIFT)   & 0x8000) != 0;
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &pt);
+
+        if (g_pop.open && g_pop.mode == POP_STEP_NOTE && inRect(g_pop.rect, pt.x, pt.y)) {
+            int baseOct = channelBaseOct(g_pop.ch);
+            g_pop.oct = std::clamp(g_pop.oct + dir, baseOct - 2, baseOct + 2);
+            redraw();
+            return 0;
+        }
+
         Hot hot; int idx, step;
         hitTest(pt.x, pt.y, hot, idx, step);
 
@@ -2063,13 +2710,35 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             EnterCriticalSection(&g_cs);
             g_proj.swing = std::clamp(g_proj.swing + dir * 0.03f, 0.0f, 0.60f);
             LeaveCriticalSection(&g_cs);
-        } else if (hot == HOT_STEP && !isDrum(idx)) {
+        } else if (hot == HOT_ROOT_KEY) {
             EnterCriticalSection(&g_cs);
-            PatternTrack& tr = g_proj.pat[g_proj.curPat].tr[idx];
-            tr.steps |= (1u << step);
-            tr.off[step] = (signed char)stepScaleOffset(g_proj.scale, tr.off[step], dir);
+            g_proj.rootKey = (g_proj.rootKey + (dir > 0 ? 1 : 11)) % 12;
+            if (g_proj.scale == SC_CUSTOM || g_proj.scale == SC_FREE) g_proj.scale = SC_MINOR;
             LeaveCriticalSection(&g_cs);
-            previewChannelStep(idx, step);
+        } else if (hot == HOT_STEP) {
+            DWORD now = GetTickCount();
+            if (idx != g_lastWheelCh || step != g_lastWheelStep || (now - g_lastWheelTick) > 650) {
+                pushUndo();
+            }
+            g_lastWheelCh = idx; g_lastWheelStep = step; g_lastWheelTick = now;
+
+            if (ctrl) {
+                unsigned mask = 1u << step;
+                EnterCriticalSection(&g_cs);
+                PatternTrack& tr = g_proj.pat[g_proj.curPat].tr[idx];
+                tr.steps |= mask;
+                if (dir > 0) tr.accents |= mask;
+                else         tr.accents &= ~mask;
+                LeaveCriticalSection(&g_cs);
+                previewChannelStep(idx, step);
+            } else if (!isDrum(idx)) {
+                EnterCriticalSection(&g_cs);
+                PatternTrack& tr = g_proj.pat[g_proj.curPat].tr[idx];
+                tr.steps |= (1u << step);
+                tr.off[step] = (signed char)stepNoteOffset(g_proj, tr.off[step], dir, shift);
+                LeaveCriticalSection(&g_cs);
+                previewChannelStep(idx, step);
+            }
         } else if (hot == HOT_VOL) {
             EnterCriticalSection(&g_cs); g_proj.ch[g_sel].vol = std::clamp(g_proj.ch[g_sel].vol + dir * 0.05f, 0.0f, 1.0f); LeaveCriticalSection(&g_cs);
         } else if (hot == HOT_PAN) {
@@ -2091,9 +2760,30 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_KEYDOWN: {
         bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool shift = (GetKeyState(VK_SHIFT)   & 0x8000) != 0;
+
+        if (wp == VK_ESCAPE) {
+            if (g_pop.open) { closePopover(); redraw(); return 0; }
+            if (g_playing)  { togglePlay();   redraw(); return 0; }
+            return 0;
+        }
+
+        // Keyboard piano input while Step Note Popover is open
+        if (g_pop.open && g_pop.mode == POP_STEP_NOTE && !ctrl) {
+            int baseOct = channelBaseOct(g_pop.ch);
+            if (wp == VK_UP)   { g_pop.oct = std::min(baseOct + 2, g_pop.oct + 1); redraw(); return 0; }
+            if (wp == VK_DOWN) { g_pop.oct = std::max(baseOct - 2, g_pop.oct - 1); redraw(); return 0; }
+            static const WPARAM kPianoVK[12] = { 'A', 'W', 'S', 'E', 'D', 'F', 'T', 'G', 'Y', 'H', 'U', 'J' };
+            for (int pc = 0; pc < 12; ++pc) {
+                if (wp == kPianoVK[pc]) {
+                    assignStepPitchClass(pc, false);
+                    redraw();
+                    return 0;
+                }
+            }
+        }
+
         if (wp == VK_SPACE && !ctrl) { togglePlay(); redraw(); return 0; }
-        if (wp == VK_ESCAPE)         { if (g_playing) togglePlay(); redraw(); return 0; }
         if (ctrl && wp == 'S')       { saveProject(); return 0; }
         if (ctrl && wp == 'O')       { openProject(); redraw(); return 0; }
         if (ctrl && wp == 'E')       { exportWav(); return 0; }
@@ -2169,7 +2859,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
     InitializeCriticalSection(&g_cs);
     loadPreset(g_proj, 0);
 
-    // Check if a .rib project file was passed via command line (double-click association)
     if (cmdLine && cmdLine[0]) {
         int argc = 0;
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -2204,7 +2893,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
 
     RECT wr = { 0, 0, WIN_W, WIN_H };
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
-    g_main = CreateWindowExW(0, L"RibbonStudioWindow", L"Ribbon 2.0",
+    g_main = CreateWindowExW(0, L"RibbonStudioWindow", L"Ribbon 2.1",
                              WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT,
                              wr.right - wr.left, wr.bottom - wr.top,
